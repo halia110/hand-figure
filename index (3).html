@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Figure</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+  #stage { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+           width: min(100vw, 100vh * 16 / 9); aspect-ratio: 16 / 9; }
+  #stage video, #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+  #stage video { filter: brightness(.7); }
+  #status { position: fixed; left: 12px; bottom: 10px; color: #fff; font-size: 13px; opacity: .85; text-shadow: 0 1px 3px #000; z-index: 20; }
+  #hint { position: fixed; right: 12px; bottom: 10px; color: #fff; font-size: 12px; opacity: .6; z-index: 5; text-align: right; line-height: 1.5; }
+  #bar { position: fixed; left: 12px; top: 12px; z-index: 6; display: flex; gap: 8px; flex-wrap: wrap; max-width: 70vw; }
+  #bar button { padding: 8px 14px; border-radius: 10px; border: 1px solid #fff4; background: #0008; color: #fff; cursor: pointer; font-size: 14px; backdrop-filter: blur(6px); }
+  #recBtn.on { background: #c0172b; border-color: #ff6b7d; }
+  #label { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); color: #fff; font-size: 26px; font-weight: 600;
+           letter-spacing: .04em; text-shadow: 0 0 14px currentColor; opacity: 0; transition: opacity .6s; z-index: 6; pointer-events: none; }
+  #start { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px; align-items: center; justify-content: center;
+           background: #0b0b10; color: #fff; z-index: 10; text-align: center; padding: 20px; }
+  #start button { font-size: 18px; padding: 12px 28px; border-radius: 12px; border: 0; background: #ff5fd2; color: #111; cursor: pointer; }
+  #start button:disabled { opacity: .45; cursor: wait; }
+  #start p { max-width: 480px; opacity: .75; line-height: 1.5; margin: 0; }
+</style>
+</head>
+<body>
+<div id="start">
+  <h1 style="margin:0">Hand Figure</h1>
+  <p>Пальцы — выбор фигуры. Ладонь — вращает. Щипок рядом с фигурой — схватить, отпусти на лету — бросок. Второй рукой — масштаб.</p>
+  <button id="startBtn">Включить камеру</button>
+  <p id="err" style="color:#ff8a8a"></p>
+</div>
+<div id="stage"><video id="video" playsinline muted></video><canvas id="three"></canvas><canvas id="overlay"></canvas></div>
+<div id="bar">
+  <button id="addBtn">＋ Объект (N)</button>
+  <button id="setBtn">Набор: Классика (Пробел)</button>
+  <button id="gravBtn">Гравитация: выкл (G)</button>
+  <button id="clrBtn">Очистить (C)</button>
+  <button id="recBtn">● Запись (V)</button>
+</div>
+<div id="label"></div>
+<div id="status">загрузка…</div>
+<div id="hint">0–5 пальцев — фигура · щипок — схватить/бросить<br>вторая рука: щипок = масштаб · H — поменять руки<br>N — объект · G — гравитация · V — запись · R — в центр · Backspace — удалить</div>
+
+<script type="module">
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js";
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d"), statusEl = $("status");
+const W = 16, H = 9;
+
+// ---------- Сцена ----------
+const renderer = new THREE.WebGLRenderer({ canvas: $("three"), alpha: true, antialias: true });
+renderer.setClearColor(0, 0);
+const scene = new THREE.Scene();
+const camera = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -50, 50);
+function resize() {
+  const r = $("stage").getBoundingClientRect();
+  renderer.setSize(r.width, r.height, false);
+  overlay.width = r.width * devicePixelRatio; overlay.height = r.height * devicePixelRatio;
+}
+addEventListener("resize", resize); resize();
+
+// ---------- Фигуры ----------
+const fromGeo = g => ({ edges: new THREE.EdgesGeometry(g, 1), fill: g });
+const bufOf = arr => new THREE.BufferGeometry().setAttribute("position", new THREE.BufferAttribute(new Float32Array(arr), 3));
+
+function stella() {
+  const a = new THREE.TetrahedronGeometry(1.5), b = new THREE.TetrahedronGeometry(1.5).scale(-1, -1, -1);
+  const ea = new THREE.EdgesGeometry(a).attributes.position.array, eb = new THREE.EdgesGeometry(b).attributes.position.array;
+  return { edges: bufOf([...ea, ...eb]), fill: null };
+}
+function dna() {
+  const p = [], N = 40, A = (t, s) => [Math.cos(t + s) * .8, (t - 6) * .35, Math.sin(t + s) * .8];
+  for (let i = 0; i < N; i++) {
+    const t = i * .3, u = (i + 1) * .3;
+    for (const s of [0, Math.PI]) p.push(...A(t, s), ...A(u, s));
+    if (i % 2 === 0) p.push(...A(t, 0), ...A(t, Math.PI));
+  }
+  return { edges: bufOf(p), fill: null };
+}
+function tesseract() {
+  const v = [], e = [];
+  for (let i = 0; i < 16; i++) v.push([i & 1 ? 1 : -1, i & 2 ? 1 : -1, i & 4 ? 1 : -1, i & 8 ? 1 : -1]);
+  for (let i = 0; i < 16; i++) for (let b = 0; b < 4; b++) if (!(i & (1 << b))) e.push([i, i | (1 << b)]);
+  const geo = bufOf(new Array(e.length * 6).fill(0));
+  const update = t => {
+    const c1 = Math.cos(t), s1 = Math.sin(t), c2 = Math.cos(t * .7), s2 = Math.sin(t * .7);
+    const pr = v.map(([x, y, z, w]) => {
+      let X = x * c1 - w * s1, W4 = x * s1 + w * c1;       // поворот XW
+      let Y = y * c2 - z * s2, Z = y * s2 + z * c2;        // поворот YZ
+      const k = 1.5 / (2.6 - W4 * .8);
+      return [X * k, Y * k, Z * k];
+    });
+    const a = geo.attributes.position.array;
+    e.forEach(([i, j], n) => a.set([...pr[i], ...pr[j]], n * 6));
+    geo.attributes.position.needsUpdate = true;
+  };
+  update(0);
+  return { edges: geo, fill: null, update };
+}
+const SETS = [
+  { name: "Классика", shapes: {
+    0: ["сфера", 0x7cf7ff, () => fromGeo(new THREE.IcosahedronGeometry(1.1, 1))],
+    1: ["тетраэдр", 0x9dff7c, () => fromGeo(new THREE.TetrahedronGeometry(1.4))],
+    2: ["октаэдр", 0xffa14d, () => fromGeo(new THREE.OctahedronGeometry(1.3))],
+    3: ["пирамида", 0xffe14d, () => fromGeo(new THREE.ConeGeometry(1.3, 2, 4))],
+    4: ["икосаэдр", 0xb28cff, () => fromGeo(new THREE.IcosahedronGeometry(1.3))],
+    5: ["куб", 0xff5fd2, () => fromGeo(new THREE.BoxGeometry(1.8, 1.8, 1.8))] } },
+  { name: "Новые", shapes: {
+    0: ["тор", 0x62ffb0, () => fromGeo(new THREE.TorusGeometry(1, .38, 10, 28))],
+    1: ["торический узел", 0xff7a7a, () => fromGeo(new THREE.TorusKnotGeometry(.9, .28, 90, 8, 2, 3))],
+    2: ["додекаэдр", 0x6ab7ff, () => fromGeo(new THREE.DodecahedronGeometry(1.3))],
+    3: ["ДНК", 0xff9bf0, dna],
+    4: ["тессеракт (4D)", 0xffffff, tesseract],
+    5: ["звезда Кеплера", 0xffd24d, stella] } },
+];
+const cache = {};
+function getFigure(set, n) {
+  const key = set + ":" + n;
+  const [name, color, make] = SETS[set].shapes[n], s = make(), g = new THREE.Group();
+  [[1, 1], [1.03, .35], [1.06, .18]].forEach(([k, o]) => {
+    const l = new THREE.LineSegments(s.edges, new THREE.LineBasicMaterial({ color, transparent: true, opacity: o, blending: THREE.AdditiveBlending, depthWrite: false }));
+    l.scale.setScalar(k); l.userData.o = o; g.add(l);
+  });
+  if (s.fill) g.add(new THREE.Mesh(s.fill, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: .07, side: THREE.DoubleSide, depthWrite: false })));
+  return { g, name, color, update: s.update };
+}
+
+// ---------- Геометрия руки ----------
+const S = l => new THREE.Vector3((l.x - .5) * W, -(l.y - .5) * H, -l.z * W);   // в координаты сцены
+const V = l => new THREE.Vector3(l.x * W, l.y * H, l.z * W);                    // для углов/расстояний
+const TILT = new THREE.Quaternion().setFromEuler(new THREE.Euler(.5, .6, 0));
+
+function handQuat(lm) {
+  const up = S(lm[9]).sub(S(lm[0])).normalize(), side = S(lm[5]).sub(S(lm[17])).normalize();
+  const nor = new THREE.Vector3().crossVectors(side, up).normalize();
+  const s2 = new THREE.Vector3().crossVectors(up, nor).normalize();
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(s2, up, nor)).multiply(TILT);
+}
+function countFingers(lm) {
+  const size = V(lm[0]).distanceTo(V(lm[9])) || .1;
+  let n = 0;
+  for (const [mcp, pip, tip] of [[5, 6, 8], [9, 10, 12], [13, 14, 16], [17, 18, 20]]) {
+    const a = V(lm[pip]).sub(V(lm[mcp])), b = V(lm[tip]).sub(V(lm[pip]));
+    const straight = a.angleTo(b) < .85;
+    const farther = V(lm[tip]).distanceTo(V(lm[0])) > V(lm[pip]).distanceTo(V(lm[0])) * 1.05;
+    if (straight && farther) n++;
+  }
+  const thumbOut = V(lm[4]).distanceTo(V(lm[5])) / size > .65 && V(lm[4]).distanceTo(V(lm[17])) > V(lm[3]).distanceTo(V(lm[17]));
+  if (thumbOut) n++;
+  return n;
+}
+const pinchRatio = lm => V(lm[4]).distanceTo(V(lm[8])) / (V(lm[0]).distanceTo(V(lm[9])) || .1);
+const pinchPoint = lm => S(lm[4]).add(S(lm[8])).multiplyScalar(.5).setZ(0);
+
+// ---------- Состояние ----------
+const MAXO = 12, objs = [], votes = [];
+let curSet = 0, curShape = 5, active = null, grabbed = null, gravity = false;
+let pinch = false, lead = "—", second = "нет", leadLm = null, handTarget = null, handPinchPt = null;
+let swapHands = false, lastTime = -1, frames = 0, fps = 0, fpsT = performance.now(), labelT, lockUntil = 0;
+
+function setFig(o) { if (o.fig) scene.remove(o.fig.g); o.fig = getFigure(o.set, o.shape); scene.add(o.fig.g); o.pop = 1; }
+function addObj(x = (Math.random() - .5) * 9, y = 2.5) {
+  if (objs.length >= MAXO) { const old = objs.shift(); scene.remove(old.fig.g); if (grabbed === old) grabbed = null; }
+  const o = { x, y, vx: (Math.random() - .5) * .15, vy: 0, scale: 1, targetScale: 1, cool: 0, shape: curShape, set: curSet,
+              q: new THREE.Quaternion().setFromEuler(new THREE.Euler(Math.random() * 3, Math.random() * 3, 0)) };
+  setFig(o); objs.push(o); active = o; return o;
+}
+function showLabel(text, color) {
+  const el = $("label"); el.textContent = text; el.style.color = "#" + color.toString(16).padStart(6, "0");
+  el.style.opacity = 1; clearTimeout(labelT); labelT = setTimeout(() => el.style.opacity = 0, 1300);
+}
+const setSetLabel = () => $("setBtn").textContent = `Набор: ${SETS[curSet].name} (Пробел)`;
+function applyShape() {
+  if (!active) return;
+  active.shape = curShape; active.set = curSet; setFig(active);
+  showLabel(`${curShape} · ${active.fig.name}`, active.fig.color);
+}
+function switchSet() { curSet = (curSet + 1) % SETS.length; setSetLabel(); applyShape(); }
+function removeActive() {
+  if (objs.length < 2) return;
+  scene.remove(active.fig.g); objs.splice(objs.indexOf(active), 1);
+  if (grabbed === active) grabbed = null; active = objs[objs.length - 1];
+}
+function clearAll() { for (const o of objs.filter(x => x !== active)) { scene.remove(o.fig.g); objs.splice(objs.indexOf(o), 1); } if (grabbed !== active) grabbed = null; }
+function toggleGravity() { gravity = !gravity; $("gravBtn").textContent = `Гравитация: ${gravity ? "вкл" : "выкл"} (G)`; }
+
+// ---------- Запись ----------
+const rec = { on: false, mr: null, chunks: [], t0: 0, cv: Object.assign(document.createElement("canvas"), { width: 1280, height: 720 }) };
+const rctx = rec.cv.getContext("2d");
+function toggleRec() {
+  if (rec.on) { rec.mr.stop(); rec.on = false; $("recBtn").classList.remove("on"); $("recBtn").textContent = "● Запись (V)"; return; }
+  const type = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find(t => MediaRecorder.isTypeSupported(t));
+  rec.mr = new MediaRecorder(rec.cv.captureStream(30), { mimeType: type, videoBitsPerSecond: 6e6 });
+  rec.chunks = [];
+  rec.mr.ondataavailable = e => e.data.size && rec.chunks.push(e.data);
+  rec.mr.onstop = () => {
+    const a = Object.assign(document.createElement("a"), { href: URL.createObjectURL(new Blob(rec.chunks, { type: "video/webm" })), download: `hand-figure-${Date.now()}.webm` });
+    a.click();
+  };
+  rec.mr.start(); rec.on = true; rec.t0 = performance.now(); $("recBtn").classList.add("on");
+}
+function drawRecFrame() {
+  const w = 1280, h = 720;
+  rctx.save(); rctx.translate(w, 0); rctx.scale(-1, 1);
+  rctx.filter = "brightness(.7)"; rctx.drawImage(video, 0, 0, w, h); rctx.filter = "none";
+  rctx.drawImage($("three"), 0, 0, w, h); rctx.drawImage(overlay, 0, 0, w, h);
+  rctx.restore();
+  $("recBtn").textContent = `⏹ Стоп ${Math.floor((performance.now() - rec.t0) / 1000)}с`;
+}
+
+// ---------- Управление ----------
+addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (e.code === "Space") { e.preventDefault(); switchSet(); }
+  else if (k === "h") swapHands = !swapHands;
+  else if (k === "n") addObj();
+  else if (k === "g") toggleGravity();
+  else if (k === "c") clearAll();
+  else if (k === "v") toggleRec();
+  else if (k === "r" && active) { active.x = active.y = active.vx = active.vy = 0; active.cool = 0; }
+  else if (e.key === "Backspace" || e.key === "Delete") removeActive();
+});
+$("setBtn").onclick = switchSet; $("addBtn").onclick = () => addObj(); $("gravBtn").onclick = toggleGravity;
+$("clrBtn").onclick = clearAll; $("recBtn").onclick = toggleRec;
+
+// ---------- MediaPipe ----------
+let landmarker;
+async function initLandmarker() {
+  statusEl.textContent = "загружаю библиотеку (wasm)…";
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const make = delegate => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+    runningMode: "VIDEO", numHands: 2 });
+  statusEl.textContent = "загружаю модель руки (GPU)…";
+  try { landmarker = await make("GPU"); }
+  catch (e) { console.warn(e); statusEl.textContent = "GPU не сработал, пробую CPU…"; landmarker = await make("CPU"); }
+}
+function drawHand(lm, color) {
+  const w = overlay.width, h = overlay.height;
+  octx.strokeStyle = octx.fillStyle = color; octx.lineWidth = 2 * devicePixelRatio; octx.globalAlpha = .85;
+  for (const c of HandLandmarker.HAND_CONNECTIONS) { octx.beginPath(); octx.moveTo(lm[c.start].x * w, lm[c.start].y * h); octx.lineTo(lm[c.end].x * w, lm[c.end].y * h); octx.stroke(); }
+  for (const p of lm) { octx.beginPath(); octx.arc(p.x * w, p.y * h, 3 * devicePixelRatio, 0, 7); octx.fill(); }
+  octx.globalAlpha = 1;
+}
+function release() { grabbed.cool = 70; grabbed = null; lockUntil = performance.now() + 700; votes.length = 0; }
+
+function detect() {
+  const res = landmarker.detectForVideo(video, performance.now());
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  const hands = res.landmarks.map((lm, i) => ({ lm, label: res.handedness[i][0].categoryName }));
+  let L = null, R = null;
+  if (hands.length === 1) L = hands[0];
+  else if (hands.length >= 2) {
+    const want = swapHands ? "Right" : "Left";
+    L = hands.find(h => h.label === want) || hands[0]; R = hands.find(h => h !== L);
+  }
+  leadLm = L ? L.lm : null;
+
+  if (L) {
+    drawHand(L.lm, "#8fe9ff");
+    const r = pinchRatio(L.lm);
+    if (!pinch && r < .28) pinch = true; else if (pinch && r > .42) pinch = false;
+    const pp = pinchPoint(L.lm);
+    handPinchPt = pp; handTarget = S(L.lm[9]);
+    if (pinch) {
+      octx.strokeStyle = "#fff"; octx.lineWidth = 3 * devicePixelRatio;
+      octx.beginPath(); octx.arc((pp.x / W + .5) * overlay.width, (-pp.y / H + .5) * overlay.height, 16 * devicePixelRatio, 0, 7); octx.stroke();
+      if (!grabbed) {                                       // хватаем ближайший объект
+        let best = null, bd = 1e9;
+        for (const o of objs) { const dd = Math.hypot(pp.x - o.x, pp.y - o.y); if (dd < 1.5 * o.scale + 1.6 && dd < bd) { bd = dd; best = o; } }
+        if (best) { grabbed = active = best; curShape = best.shape; curSet = best.set; setSetLabel(); }
+      }
+    } else if (grabbed) release();
+
+    if (!pinch && !grabbed && performance.now() > lockUntil) {
+      votes.push(countFingers(L.lm)); if (votes.length > 7) votes.shift();
+      const cnt = {}; votes.forEach(v => cnt[v] = (cnt[v] || 0) + 1);
+      const best = +Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0];
+      lead = String(best);
+      if (votes.length >= 5 && cnt[best] >= 5 && best !== curShape) { curShape = best; applyShape(); }
+    }
+  } else { lead = "—"; pinch = false; handTarget = null; if (grabbed) release(); votes.length = 0; }
+
+  if (R && active) { active.targetScale = Math.min(3, Math.max(.3, .3 + pinchRatio(R.lm) * 1.5)); drawHand(R.lm, "#ff7ad9"); second = `масштаб x${active.scale.toFixed(2)}`; }
+  else second = "нет";
+
+  frames++;
+  const now = performance.now();
+  if (now - fpsT > 1000) { fps = Math.round(frames * 1000 / (now - fpsT)); frames = 0; fpsT = now; }
+}
+
+// ---------- Главный цикл ----------
+const dq = new THREE.Quaternion(), axis = new THREE.Vector3();
+function loop() {
+  requestAnimationFrame(loop);
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastTime) { lastTime = video.currentTime; detect(); }
+
+  for (const o of objs) {
+    const px = o.x, py = o.y;
+    if (o === grabbed && handPinchPt) {
+      o.x += (handPinchPt.x - o.x) * .45; o.y += (handPinchPt.y - o.y) * .45;
+      o.vx = o.vx * .6 + (o.x - px) * .4; o.vy = o.vy * .6 + (o.y - py) * .4;
+    } else if (o === active && o.cool <= 0 && handTarget) {
+      o.x += (handTarget.x - o.x) * .14; o.y += (handTarget.y + 1.6 - o.y) * .14;
+      o.vx = o.x - px; o.vy = o.y - py;
+    } else {
+      if (gravity) o.vy -= .006;
+      o.x += o.vx; o.y += o.vy;
+      const d = gravity ? .996 : .985; o.vx *= d; o.vy *= d;
+      const bx = W / 2 - .9 * o.scale, by = H / 2 - .9 * o.scale;
+      if (Math.abs(o.x) > bx) { o.x = Math.sign(o.x) * bx; o.vx *= -.85; }
+      if (Math.abs(o.y) > by) { o.y = Math.sign(o.y) * by; o.vy *= gravity ? -.6 : -.85; if (gravity) o.vx *= .98; }
+      if (o.cool > 0) o.cool--;
+    }
+    o.scale += (o.targetScale - o.scale) * .2;
+  }
+  // столкновения объектов
+  for (let i = 0; i < objs.length; i++) for (let j = i + 1; j < objs.length; j++) {
+    const a = objs[i], b = objs[j], dx = b.x - a.x, dy = b.y - a.y, dist = Math.hypot(dx, dy), min = 1.1 * (a.scale + b.scale);
+    if (dist >= min || dist < 1e-4) continue;
+    const nx = dx / dist, ny = dy / dist, ov = min - dist, ga = a === grabbed, gb = b === grabbed;
+    if (!ga) { a.x -= nx * ov * (gb ? 1 : .5); a.y -= ny * ov * (gb ? 1 : .5); }
+    if (!gb) { b.x += nx * ov * (ga ? 1 : .5); b.y += ny * ov * (ga ? 1 : .5); }
+    const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+    if (rel < 0) {
+      const k = -.95 * rel * (ga || gb ? 2 : 1);   // упругий удар; у схваченного руки «бесконечная масса»
+      if (!ga) { a.vx -= nx * k; a.vy -= ny * k; }
+      if (!gb) { b.vx += nx * k; b.vy += ny * k; }
+    }
+  }
+  const t = performance.now() / 1000;
+  for (const o of objs) {
+    const speed = Math.hypot(o.vx, o.vy);
+    if (o === active && leadLm && !pinch) o.q.slerp(handQuat(leadLm), .25);
+    else { dq.setFromAxisAngle(axis.set(0, 1, 0), .01); o.q.premultiply(dq); }
+    if (speed > .03) { dq.setFromAxisAngle(axis.set(o.vy, -o.vx, 0).normalize(), speed * .9); o.q.premultiply(dq); }
+    o.pop *= .9;
+    const g = o.fig.g;
+    g.position.set(o.x, o.y, 0); g.scale.setScalar(o.scale * (1 + o.pop * .3)); g.quaternion.copy(o.q);
+    const boost = (o === grabbed ? 1.8 : 1 + o.pop) * (o === active ? 1 : .7);
+    g.children.forEach(c => { if (c.isLineSegments) c.material.opacity = Math.min(1, c.userData.o * boost); });
+    if (o.fig.update) o.fig.update(t);
+  }
+  renderer.render(scene, camera);
+  if (rec.on) drawRecFrame();
+
+  statusEl.textContent = `ведущая рука: ${lead} · вторая рука: ${second} · объектов: ${objs.length}${grabbed ? " · схвачено" : ""}${rec.on ? " · ● REC" : ""} · ${fps} fps`;
+}
+
+// ---------- Старт ----------
+$("startBtn").onclick = async () => {
+  try {
+    $("startBtn").disabled = true;
+    statusEl.textContent = "запрашиваю камеру…";
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "user" }, audio: false });
+    await video.play();
+    await initLandmarker();
+    addObj(0, 0); $("start").remove(); resize(); loop();
+  } catch (e) {
+    console.error(e); $("err").textContent = "Ошибка: " + e.message; $("startBtn").disabled = false;
+  }
+};
+</script>
+</body>
+</html>
